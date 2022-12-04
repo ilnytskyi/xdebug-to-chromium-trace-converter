@@ -1,0 +1,462 @@
+#!/usr/bin/env php
+<?php
+/* xDebug to Chromium Trace Converter
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/**
+ * Only supports xdebug.trace_format=1
+ * Generate a trace with a command like this:
+ *
+ * XDEBUG_MODE=trace XDEBUG_TRIGGER=PHPSTORM php {script.php}
+ *
+ * To se variables and returns values update your php.ini or override xdebug configs
+ * - be aware that adding variables or return values significantly increases the trace size
+ * XDEBUG_MODE=trace XDEBUG_TRIGGER=PHPSTORM php -d xdebug.collect_return=1 {script.php}
+ *
+ * For more information
+ * @see https://xdebug.org/docs/trace
+ *
+ * Visualizers:
+ * - any that supports Chromium format
+ * Chromium performance tab
+ * https://www.speedscope.app
+ * https://ui.perfetto.dev
+ */
+
+declare(strict_types=1);
+
+ini_set('display_errors', '1');
+ini_set('display_startup_errors', '1');
+ini_set('memory_limit', '-1');
+
+error_reporting(E_ALL);
+
+if (in_array(PHP_SAPI, ['cli', 'phpdbg', 'embed'], true) === false) {
+    echo PHP_EOL . 'Only works in command line, got "' . PHP_SAPI . '"' . PHP_EOL;
+
+    exit(1);
+}
+
+class XDebugToChromiumTraceConverter
+{
+    public const RECORD_ENTRY = 0;
+    public const RECORD_EXIT = 1;
+    public const RECORD_RETURN = 'R';
+    public const RECORD_ASSIGMENT = 'A';
+    public const FUNCTION_INTERNAL = 0;
+    public const EVENT_TYPE_COMPLETED = 'X';
+    public const MIN_NUMBER_OF_EVENT_COLUMNS = 4;
+    public const SEPARATOR = "\t"; //tab character must be in double quotes to work correctly
+    public const MICROSECONDS_INT = 1_000_000;
+
+    protected int $showInternal = 0;
+    protected int $showArgs = 0;
+    protected int $sampling = 0;
+    protected array $commands = [];
+    protected array $specialTypesMap = [
+        self::RECORD_RETURN => self::RECORD_RETURN,
+        self::RECORD_ASSIGMENT => self::RECORD_ASSIGMENT,
+    ];
+    protected array $functionIdx = [];
+    protected array $returnIdx = [];
+    protected array $commandsOptions = [];
+    protected array $allowedExtensions = ['xt', 'gz'];
+
+    public function __construct()
+    {
+        $this->functionIdx = array_flip([
+            'depth',
+            'function_index',
+            'record_type',
+            'time_index',
+            'memory_usage',
+            'function_name',
+            'function_type',
+            'include_name',
+            'filename',
+            'line_number',
+            'number_of_arguments',
+            'arguments_start_index'
+        ]);
+
+        $this->returnIdx = array_flip([
+            'depth',
+            'function_index',
+            'record_type',
+            '__empty_1',
+            '__empty_2',
+            'return_value'
+        ]);
+
+        $this->commands = [
+            'convert' => 'convert',
+            'watch' => 'watch',
+        ];
+
+        $this->commandsOptions = [
+            'convert' => [
+                'file',
+                'out',
+                'sampling',
+                'internal',
+                'args',
+                'help',
+            ],
+            'watch' => [
+                'dir',
+                'out',
+                'sampling',
+                'internal',
+                'args',
+                'help',
+            ],
+        ];
+    }
+
+    public function toMicroseconds(float $value): int
+    {
+        return (int)($value * self::MICROSECONDS_INT);
+    }
+
+    /**
+     * @return int|string
+     */
+    public function resolveRecordType(string $rawType)
+    {
+        $specialType = $this->specialTypesMap[$rawType] ?? null;
+
+        if ($specialType) {
+            return $specialType;
+        }
+
+        if (is_numeric($rawType)) {
+            return (int)$rawType;
+        }
+
+        return $rawType;
+    }
+
+    public function sanitizeValue(string $value): string
+    {
+        $value = mb_convert_encoding($value, 'UTF-8');
+        $value = str_replace('\\\\', '\\', $value);
+
+        return trim($value);
+    }
+
+    public function readTxtTraceByLine(string $filePath): Generator
+    {
+        $file = fopen($filePath, 'r');
+
+        if (!$file) {
+            throw new Exception(
+                sprintf('Could not open trace "%s".', $filePath)
+            );
+        }
+        while (($line = fgets($file)) !== false) {
+            yield $line;
+        }
+
+        fclose($file);
+    }
+
+    public function readGzTraceByLine(string $filePath): Generator
+    {
+        $file = gzopen($filePath, 'r');
+
+        if (!$file) {
+            throw new Exception(
+                sprintf('Could not open trace "%s".', $filePath)
+            );
+        }
+        while (($line = gzgets($file)) !== false) {
+            yield $line;
+        }
+
+        gzclose($file);
+    }
+
+    public function readTraceFile(string $filePath): Generator
+    {
+        $pathInfo = pathinfo($filePath);
+
+        if (strtolower($pathInfo['extension']) === 'gz') {
+            return $this->readGzTraceByLine($filePath);
+        }
+
+        return $this->readTxtTraceByLine($filePath);
+    }
+
+    public function run(array $args): void
+    {
+        $command = $this->getCommandName($args);
+        $options = $this->resolveCommandOptions($args);
+
+        $this->$command($options);
+    }
+
+    public function resolveCommandOptions(array $args): array
+    {
+        $command = $this->getCommandName($args);
+
+        $parsedOptions = [];
+        foreach ($args as $arg) {
+            $parsed = explode('=', $arg, 2);
+            $option = $parsed[0] ?? null;
+            $value = $parsed[1] ?? null;
+            if (!$option) {
+                continue;
+            }
+
+            $argName = str_replace('--', '', $option);
+            if (in_array($argName, $this->commandsOptions[$command])) {
+                if ($value) {
+                    $value = trim($value, '"');
+                }
+                $parsedOptions[$argName] = $value;
+            }
+        }
+
+        return $parsedOptions;
+    }
+
+    public function getCommandName(array $args): string
+    {
+        $command = $args[1] ?? null;
+        if (!isset($this->commands[$command])) {
+            echo 'Unknown command: ' . $command . PHP_EOL;
+            echo 'Available commands: ' . implode(', ', $this->commands) . PHP_EOL;
+
+            exit(0);
+        }
+
+        return $command;
+    }
+
+    public function convert(array $convertOptions): void
+    {
+        if (array_key_exists('help', $convertOptions)) {
+            echo PHP_EOL;
+            echo <<<EOF
+--file=<name>           Input trace file .txt .tx or .gz (for .gz sure zlib is installed https://www.php.net/manual/en/zlib.setup.php)
+--out=<name>            Output file
+--sampling=<value>      Skip function with inclusive wall time below given value in microseconds (μs). 0 - no sampling
+--internal=<1/0>        Whether to show internal PHP functions. Default: $this->showInternal
+--args=<1/0>            Whether to show passed arguments. Default: $this->showArgs
+--help                  Show this help information
+EOF;
+            echo PHP_EOL;
+            echo PHP_EOL;
+            exit();
+        }
+
+        $inputTrace = $convertOptions['file'] ?? null;
+        $outputTrace = $convertOptions['out'] ?? null;
+        $this->sampling = (int)($convertOptions['sampling'] ?? null);
+        $this->showInternal = (int)($convertOptions['internal'] ?? null);
+        $this->showArgs = (int)($convertOptions['args'] ?? null);
+
+        if (empty($inputTrace)) {
+            echo 'No trace filepath provided! --file=<filename> Not provided' . PHP_EOL;
+            exit();
+        }
+
+        $outputFile = $inputTrace . '.json';
+        $outputFileInfo = pathinfo($outputFile);
+
+        if ($outputTrace !== null) {
+            $outputFile = $outputTrace;
+
+            if (is_dir($outputTrace)) {
+                $outputFile = rtrim($outputTrace, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $outputFileInfo['basename'];
+            }
+        }
+
+        echo <<<EOF
+The trace file:                   $inputTrace
+Will be processed to:             $outputFile
+With following convertOptions
+ Show internal PHP functions:     $this->showInternal
+ Show arguments:                  $this->showArgs
+ Sampling:                        $this->sampling μs
+EOF;
+        echo PHP_EOL;
+
+        $traceStructure = [
+            'traceEvents' => [],
+            'meta_user' => 'args',
+        ];
+        $events = [];
+
+        if ($this->sampling) {
+            $traceStructure['meta_sampling'] = $this->sampling;
+        }
+
+        $lastFunctionIndex = null;
+
+        foreach ($this->readTraceFile($inputTrace) as $line) {
+            $event = explode(static::SEPARATOR, $line);
+
+            if (count($event) < static::MIN_NUMBER_OF_EVENT_COLUMNS) {
+                continue;
+            }
+
+            $recordType = $this->resolveRecordType((string)$event[$this->functionIdx['record_type']]);
+            $functionType = (int)($event[$this->functionIdx['function_type']] ?? null);
+            $recordIndex = sprintf(
+                '%s_%s',
+                $event[$this->functionIdx['depth']],
+                $event[$this->functionIdx['function_index']],
+            );
+
+            if ($recordIndex == '_') {
+                continue;
+            }
+
+            if (in_array($recordType, [static::RECORD_ENTRY, static::RECORD_EXIT], true)) {
+                $lastFunctionIndex = $recordIndex;
+            }
+
+            if ($recordType === static::RECORD_ENTRY && $functionType === static::FUNCTION_INTERNAL && !$this->showInternal) {
+                continue;
+            }
+
+            if ($recordType === static::RECORD_ENTRY) {
+                $numberOfArguments = (int)$event[$this->functionIdx['number_of_arguments']];
+                $events[$recordIndex] = [
+                    'pid' => 1,
+                    'tid' => 1,
+                    'ph' => static::EVENT_TYPE_COMPLETED,
+                    'ts' => $this->toMicroseconds((float)$event[$this->functionIdx['time_index']]),
+                    'name' => $event[$this->functionIdx['function_name']],
+                    'args' => []
+                ];
+
+                if ($numberOfArguments) {
+                    $events[$recordIndex]['args']['args_number'] = $numberOfArguments;
+                    if ($this->showArgs) {
+                        $functionArgumentsValues = array_slice($event, $this->functionIdx['arguments_start_index']);
+                        foreach ($functionArgumentsValues as $argIndex => $argumentValue) {
+                            $events[$recordIndex]['args']['arg_' . $argIndex] = $this->sanitizeValue(
+                                (string)$argumentValue
+                            );
+                        }
+                    }
+                    unset($functionArgumentsValues);
+                }
+            }
+
+            if ($recordType === static::RECORD_EXIT && isset($events[$recordIndex])) {
+                $startTime = $events[$recordIndex]['ts'];
+                $endTime = $this->toMicroseconds((float)$event[$this->functionIdx['time_index']]);
+                $duration = $endTime - $startTime;
+
+                $events[$recordIndex]['dur'] = $duration;
+
+                if ($this->sampling && $duration < $this->sampling) {
+                    unset($events[$recordIndex]);
+                    continue;
+                }
+            }
+
+            if ($recordType === static::RECORD_RETURN && isset($events[$recordIndex])) {
+                $events[$recordIndex]['args']['return'] = $this->sanitizeValue(
+                    (string)$event[$this->returnIdx['return_value']]
+                );
+            }
+            //TODO: visualize vars assignments mb using $lastFunctionIndex somehow draw them on timeline or in separate frame
+            //if ($recordType === static::RECORD_ASSIGMENT && isset($events[$lastFunctionIndex])) {}
+        }
+
+        $traceStructure['traceEvents'] += array_values($events);
+
+        file_put_contents(
+            $outputFile,
+            json_encode($traceStructure, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+        );
+
+        echo 'Trace is processed successfully ' . $outputFile . PHP_EOL;
+    }
+
+    public function watch(array $watchOptions): void
+    {
+        if (array_key_exists('help', $watchOptions)) {
+            echo PHP_EOL;
+            echo <<<EOF
+--dir=<name>            Input dir to watch for new trace files
+--out=<name>            Output dir, if provided converted profiles will be moved to this location
+--help                  Show this help information
+
+Parameters below define how watched files must be converted.
+See more details in "convert" command.
+
+--sampling=<value>
+--internal=<1/0>
+--args=<1/0>
+EOF;
+            echo PHP_EOL;
+            echo PHP_EOL;
+            exit();
+        }
+
+        //FIXME: Would be better to use inotify instead but that would require installing inotify extension
+        $directory = $watchOptions['dir'] ?? null;
+
+        if (!$directory) {
+            echo 'Directory is not specified' . PHP_EOL;
+            exit();
+        }
+
+        if (!is_dir($directory)) {
+            echo sprintf('Directory "%s" does not exist', $directory) . PHP_EOL;
+            exit();
+        }
+
+        echo sprintf('Directory "%s" is being watched for new profiles', $directory) . PHP_EOL;
+        $firstScan = scandir($directory);
+
+        while (true) {
+            sleep(1);
+            $secondScan = scandir($directory);
+            $newFiles = array_diff($secondScan, $firstScan);
+
+            if (!empty($newFiles)) {
+                foreach ($newFiles as $newFile) {
+                    $fileInfo = pathinfo($newFile);
+                    $extension = $fileInfo['extension'];
+
+                    if (in_array($extension, $this->allowedExtensions)) {
+                        $tracePath = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $newFile;
+                        echo 'New profile detected ' . $tracePath . PHP_EOL;
+
+                        $commonOptions = array_intersect_key(
+                            $watchOptions,
+                            array_flip($this->commandsOptions['convert'])
+                        );
+                        $commonOptions['file'] = $tracePath;
+
+                        $this->convert($commonOptions);
+                    }
+                }
+            }
+
+            $firstScan = $secondScan;
+        }
+    }
+}
+
+$converter = new XDebugToChromiumTraceConverter();
+$converter->run($argv);
