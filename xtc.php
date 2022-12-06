@@ -380,6 +380,13 @@ EOF;
             //TODO: visualize vars assignments mb using $lastFunctionIndex somehow draw them on timeline or in separate frame
             //if ($recordType === static::RECORD_ASSIGMENT && isset($events[$lastFunctionIndex])) {}
         }
+        if (empty($events)) {
+            echo PHP_EOL;
+            echo '-> Trace file is empty or malformed.' . PHP_EOL;
+            echo '-> Make sure xDebug dump created with xdebug.trace_format=1 ini option!' . PHP_EOL;
+            echo '-> Converter has not completed correctly.' . PHP_EOL;
+            exit;
+        }
 
         $traceStructure['traceEvents'] += array_values($events);
 
