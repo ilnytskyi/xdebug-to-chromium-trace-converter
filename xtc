@@ -64,6 +64,7 @@ class XDebugToChromiumTraceConverter
 
     protected int $showInternal = 0;
     protected int $showArgs = 0;
+    protected int $showReturn = 0;
     protected int $sampling = 0;
     protected array $commands = [];
     protected array $specialTypesMap = [
@@ -102,6 +103,7 @@ class XDebugToChromiumTraceConverter
         ]);
 
         $this->commands = [
+            'trace' => 'trace',
             'convert' => 'convert',
             'watch' => 'watch',
         ];
@@ -123,6 +125,16 @@ class XDebugToChromiumTraceConverter
                 'args',
                 'help',
             ],
+            'trace' => [
+                'debug',
+                'cmd',
+                'out',
+                'sampling',
+                'internal',
+                'args',
+                'ret',
+                'help',
+            ]
         ];
     }
 
@@ -281,7 +293,10 @@ EOF;
             $outputFile = $outputTrace;
 
             if (is_dir($outputTrace)) {
-                $outputFile = rtrim($outputTrace, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $outputFileInfo['basename'];
+                $outputFile = rtrim(
+                        $outputTrace,
+                        DIRECTORY_SEPARATOR
+                    ) . DIRECTORY_SEPARATOR . $outputFileInfo['basename'];
             }
         }
 
@@ -462,6 +477,117 @@ EOF;
 
             $firstScan = $secondScan;
         }
+    }
+
+    public function trace(array $traceOptions): void
+    {
+        if (array_key_exists('help', $traceOptions)) {
+            echo PHP_EOL;
+            echo <<<EOF
+--cmd=<name>            PHP command to be traced without php binary.
+--out=<name>            Output dir, if provided converted profiles will be moved to this location
+--help                  Show this help information
+
+Parameters below define how trace files must be converted.
+See more details in "convert" command.
+
+--sampling=<value>      Sampling period
+--internal=<1}0>        Collect internal functions calls. Default: $this->showInternal
+--args=<1/0>            Collect function arguments. Default: $this->showArgs
+--ret=<1/0>             Collect return values. Default: $this->showReturn
+EOF;
+            echo PHP_EOL;
+            echo PHP_EOL;
+            exit();
+        }
+
+        $cmd = $traceOptions['cmd'] ?? null;
+        $debug = array_key_exists('debug', $traceOptions);
+
+        if (!$cmd) {
+            echo "No cmd provided!" . PHP_EOL;
+            exit(1);
+        }
+
+        $cmdParts = explode(' ', $cmd);
+        $firstPart = $cmdParts[0] ?? false;
+
+        if (in_array($firstPart, ['php', PHP_BINARY])) {
+            echo "Warning: Stripping php binary" . PHP_EOL;
+            unset($cmdParts[0]);
+
+            //TODO: strip ini passed via -d
+            if (str_contains($cmd, '-d xdebug.')) {
+                echo "Warning: do not override php ini settings" . PHP_EOL;
+            }
+        }
+
+        echo "Tracing: $cmd" . PHP_EOL;
+
+        $outputIniDir = ini_get('xdebug.output_dir');
+
+        if (!$outputIniDir) {
+            echo "Error: xdebug.output_dir ini not specified" . PHP_EOL;
+            exit(1);
+        }
+
+        if (!is_dir($outputIniDir)) {
+            echo "Warning: dir $outputIniDir does not exists. Creating..." . PHP_EOL;
+
+            passthru("mkdir -p $outputIniDir");
+
+            if (!is_dir($outputIniDir)) {
+                echo "Error: could not create output dir $outputIniDir" . PHP_EOL;
+                exit(1);
+            }
+        }
+
+        $triggerValue = getenv('XDEBUG_TRIGGER') ?: getenv('XDEBUG_SESSION') ?: 'PHPSTORM';
+
+        $targetCommand = [
+            'XDEBUG_MODE=trace',
+            'XDEBUG_TRIGGER=' . $triggerValue,
+            PHP_BINARY,
+            '-d xdebug.collect_return=' . $this->showReturn,
+            '-d xdebug.collect_params=' . $this->showArgs,
+            '-d xdebug.collect_assignments=0',
+            '-d xdebug.trace_format=1',
+            '-d xdebug.trigger_value="' . $triggerValue . '"',
+            '-d xdebug.trace_output_name=xtc_trace.%t',
+            ...$cmdParts
+        ];
+
+        $targetCommandString = implode(' ', $targetCommand);
+
+        if ($debug) {
+            echo PHP_EOL;
+            var_dump($targetCommandString);
+            echo PHP_EOL;
+        }
+
+        passthru($targetCommandString);
+
+        $latestTraceFileCommand = "ls -Art $outputIniDir | tail -n 1";
+        $fileName = trim(shell_exec($latestTraceFileCommand) ?: '');
+
+        if (!$fileName) {
+            echo "Error: could find latest dump in output dir $outputIniDir" . PHP_EOL;
+            exit(1);
+        }
+
+        $fullFilePath = realpath($outputIniDir . '/' . $fileName);
+
+        echo PHP_EOL;
+        echo "Converting $fullFilePath" . PHP_EOL;
+        echo PHP_EOL;
+
+        $commonOptions = array_intersect_key(
+            $traceOptions,
+            array_flip($this->commandsOptions['convert'])
+        );
+        $commonOptions['file'] = $fullFilePath;
+
+        $this->convert($commonOptions);
     }
 }
 

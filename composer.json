@@ -1,0 +1,20 @@
+{
+    "name": "ilnytskyi/xtc",
+    "description": "xDebug to Chromium Google Trace Event Format converter",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Stanislav Ilnytskyi",
+            "email": "webmageic@gmail.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "ext-json": "*",
+        "ext-tokenizer": "*",
+        "ext-zlib": "*"
+    },
+    "bin": [
+        "xtc"
+    ]
+}
