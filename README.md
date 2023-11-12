@@ -21,7 +21,7 @@ composer require ilnytskyi/xtc
 
 - As dev only dependency
 ```
-composer require-dev ilnytskyi/xtc
+composer require --dev ilnytskyi/xtc
 ```
 
 ## Installation from git
