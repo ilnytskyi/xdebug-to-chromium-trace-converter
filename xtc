@@ -350,7 +350,7 @@ EOF;
             }
 
             if ($recordType === static::RECORD_ENTRY) {
-                $numberOfArguments = (int)$event[$this->functionIdx['number_of_arguments']];
+                $numberOfArguments = (int)($event[$this->functionIdx['number_of_arguments']] ?? null);
                 $events[$recordIndex] = [
                     'pid' => 1,
                     'tid' => 1,
