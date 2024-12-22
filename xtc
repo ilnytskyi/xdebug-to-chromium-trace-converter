@@ -395,6 +395,24 @@ EOF;
             //TODO: visualize vars assignments mb using $lastFunctionIndex somehow draw them on timeline or in separate frame
             //if ($recordType === static::RECORD_ASSIGMENT && isset($events[$lastFunctionIndex])) {}
         }
+
+        /**
+         * In perfetto web ui, args must be an object, it should not be an array, so if there are no parameters when the
+         * method is called or xdebug.collect_params is not set, an error will be raised when using perfetto web ui.
+         * UI: https://ui.perfetto.dev/v48.1-eb5adbbd8
+         *
+         * Failure parsing JSON: unsupported JSON dictionary with array: '[],"dur":50903209}'
+         *
+         * Trace: not available (No trace loaded). Provide repro steps.
+         *
+         * @see https://ui.perfetto.dev/
+         */
+        foreach ($events as $eventIndex => $event) {
+            if (empty($event['args']) && is_array($event['args'])) {
+                $events[$eventIndex]['args'] = (object) $event['args'];
+            }
+        }
+
         if (empty($events)) {
             echo PHP_EOL;
             echo '-> Trace file is empty or malformed.' . PHP_EOL;
